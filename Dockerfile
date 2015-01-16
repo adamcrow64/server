@@ -1,5 +1,5 @@
 FROM  busybox 
-
+ 
 ADD bin/server /server
 
 VOLUME /www
