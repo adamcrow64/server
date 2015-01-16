@@ -1,192 +1,52 @@
-package server
-
+package main
+ 
 import (
-	"encoding/json"
+	"flag"
 	"fmt"
-	"io"
+	"log"
 	"net/http"
-	"sync"
-
-	"github.com/Sirupsen/logrus"
-	"github.com/crosbymichael/proxy"
-	"github.com/gorilla/mux"
+	"os"
 )
-
-type Server interface {
-	io.Closer
-	http.Handler
+ 
+type verboseHandler struct {
+	h http.Handler
 }
-
-type server struct {
-	sync.Mutex
-
-	r        *mux.Router
-	backends map[string]proxy.Proxy
-	logger   *logrus.Logger
+ 
+func NewVerboseHandler(h http.Handler) http.Handler {
+	return &verboseHandler{h}
 }
-
-func New(logger *logrus.Logger) Server {
-	r := mux.NewRouter()
-
-	s := &server{
-		r:        r,
-		logger:   logger,
-		backends: make(map[string]proxy.Proxy),
+ 
+func (h *verboseHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	log.Printf("%s: %s\n", r.Method, r.URL.String())
+	h.h.ServeHTTP(w, r)
+}
+ 
+func getServer(cwd string, verbose bool) http.Handler {
+	h := http.FileServer(http.Dir(cwd))
+	if verbose {
+		h = NewVerboseHandler(h)
 	}
-
-	r.HandleFunc("/", s.listBackends).Methods("GET")
-	r.HandleFunc("/{id:.*}", s.getBackend).Methods("GET")
-	r.HandleFunc("/{id:.*}", s.addBackend).Methods("POST")
-	r.HandleFunc("/{id:.*}", s.deleteBackend).Methods("DELETE")
-
-	return s
+	return h
 }
-
-func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	s.r.ServeHTTP(w, r)
-}
-
-func (s *server) Close() error {
-	s.Lock()
-	defer s.Unlock()
-
-	var err error
-	for id, p := range s.backends {
-		if nerr := p.Close(); nerr != nil {
-			s.logger.WithFields(logrus.Fields{
-				"error": err,
-				"id":    id,
-			}).Error("closing backend proxy")
-
-			err = nerr
-		}
-	}
-
-	return err
-}
-
-func (s *server) listBackends(w http.ResponseWriter, r *http.Request) {
-	s.logger.Debug("listing backends")
-
-	out := []*proxy.Backend{}
-
-	s.Lock()
-	for _, p := range s.backends {
-		out = append(out, p.Backend())
-	}
-	s.Unlock()
-
-	s.marshal(w, out)
-}
-
-func (s *server) getBackend(w http.ResponseWriter, r *http.Request) {
-	id := mux.Vars(r)["id"]
-
-	s.logger.WithField("id", id).Debug("getting backend")
-
-	s.Lock()
-	p, exists := s.backends[id]
-	s.Unlock()
-
-	if !exists {
-		w.WriteHeader(http.StatusNotFound)
-
-		return
-	}
-
-	s.marshal(w, p.Backend())
-}
-
-func (s *server) addBackend(w http.ResponseWriter, r *http.Request) {
-	var (
-		backend *proxy.Backend
-		id      = mux.Vars(r)["id"]
-	)
-
-	s.logger.WithField("id", id).Debug("adding new backend")
-
-	s.Lock()
-	_, exists := s.backends[id]
-	s.Unlock()
-
-	if exists {
-		http.Error(w, fmt.Sprintf("%s already exists", id), http.StatusConflict)
-
-		return
-	}
-
-	if err := json.NewDecoder(r.Body).Decode(&backend); err != nil {
-		s.logger.WithField("error", err).Error("decoding backend json")
-		http.Error(w, err.Error(), http.StatusBadRequest)
-
-		return
-	}
-	backend.Name = id
-
-	s.Lock()
-	defer s.Unlock()
-
-	proxy, err := proxy.New(backend)
+ 
+func main() {
+	cwd, err := os.Getwd()
 	if err != nil {
-		s.logger.WithField("error", err).Error("creating new proxy")
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-
-		return
+		panic(err)
 	}
-
-	s.backends[id] = proxy
-
-	if err := proxy.Start(); err != nil {
-		s.logger.WithFields(logrus.Fields{
-			"error": err,
-			"id":    id,
-		}).Error("starting new proxy")
-
-		delete(s.backends, id)
-
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-
-		return
-	}
-
-	w.WriteHeader(http.StatusCreated)
-}
-
-func (s *server) deleteBackend(w http.ResponseWriter, r *http.Request) {
-	id := mux.Vars(r)["id"]
-
-	s.logger.WithField("id", id).Info("deleting backend")
-
-	s.Lock()
-	p, exists := s.backends[id]
-	s.Unlock()
-
-	if !exists {
-		w.WriteHeader(http.StatusNotFound)
-
-		return
-	}
-
-	if err := p.Close(); err != nil {
-		s.logger.WithFields(logrus.Fields{
-			"error": err,
-			"id":    id,
-		}).Error("closing backend proxy")
-
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-
-		// don't return here
-	}
-
-	s.Lock()
-	delete(s.backends, id)
-	s.Unlock()
-}
-
-func (s *server) marshal(w http.ResponseWriter, v interface{}) {
-	w.Header().Set("content-type", "application/json")
-
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		s.logger.WithField("error", err).Error("marshal json")
+ 
+	ip := flag.String("h", "localhost", "Ip to bind to")
+	port := flag.String("p", "8080", "Port to serve from")
+	verbose := flag.Bool("v", false, "Verbose output")
+	dir := flag.String("dir", cwd, "Folder to serve static files from")
+ 
+	flag.Parse()
+ 
+	location := fmt.Sprintf("%s:%s", *ip, *port)
+	log.Printf("Serving files from %s at %s\n", *dir, location)
+ 
+	server := getServer(*dir, *verbose)
+	if err = http.ListenAndServe(location, server); err != nil {
+		panic(err)
 	}
 }
