@@ -1,6 +1,6 @@
 FROM  busybox 
 
-ADD server /server
+ADD bin/server /server
 
 VOLUME /www
 #USER daemon
